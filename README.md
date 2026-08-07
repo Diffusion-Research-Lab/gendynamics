@@ -5,13 +5,13 @@ GenDynamics provides compact PyTorch implementations of diffusion and flow-match
 ## Installation
 
 ```bash
-pip install "gendynamics @ git+ssh://git@github.com/Diffusion-Research/gendynamics.git"
+pip install "gendynamics @ git+ssh://git@github.com/Diffusion-Research-Lab/gendynamics.git"
 ```
 
 For development:
 
 ```bash
-git clone git@github.com:Diffusion-Research/gendynamics.git
+git clone git@github.com:Diffusion-Research-Lab/gendynamics.git
 cd gendynamics
 python -m pip install -e ".[dev,examples]"
 ```

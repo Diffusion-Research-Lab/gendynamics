@@ -42,7 +42,7 @@ vendor = [
 ]
 
 [project.urls]
-Repository = "https://github.com/Diffusion-Research/gendynamics"
+Repository = "https://github.com/Diffusion-Research-Lab/gendynamics"
 
 [tool.setuptools]
 packages = ["gendynamics"]
