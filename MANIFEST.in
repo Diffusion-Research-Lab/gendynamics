@@ -1,0 +1,12 @@
+include README.md
+include LICENSE
+include pyproject.toml
+include Makefile
+
+recursive-include gendynamics *.py
+recursive-include examples *.py
+recursive-include scripts *.py *.sh
+prune gendynamics/_vendor
+
+global-exclude __pycache__
+global-exclude *.py[cod]
