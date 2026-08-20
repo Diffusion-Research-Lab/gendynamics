@@ -1,6 +1,7 @@
 """Base classes for diffusion and flow-matching models."""
 
 import math
+from collections.abc import Callable
 import torch
 from ._schedules import build_flow_timesteps, cosine_schedule
 from ._solvers import sample_ddim, sample_ddpm, sample_flow, sample_flow_adaptive_heun
@@ -211,16 +212,25 @@ class DDPMAbstract(Base):
         """Average DDPM losses over the batch."""
         return loss_values.mean()
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def _sample(
         self,
         n_samples: int | None = None,
         return_trajectory: bool = True,
         sample_source: torch.Tensor | None = None,
+        start_step: int | None = None,
+        guidance: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         """Dispatch to a native DDPM inference sampler."""
         if self._sampler == "ddpm":
-            return sample_ddpm(self, n_samples, return_trajectory=return_trajectory, sample_source=sample_source)
+            return sample_ddpm(self,
+                               n_samples,
+                               return_trajectory=return_trajectory,
+                               sample_source=sample_source,
+                               start_step=start_step,
+                               guidance=guidance)
+        if start_step is not None or guidance is not None:
+            raise ValueError("start_step and guidance are only supported by the stochastic DDPM sampler.")
         return sample_ddim(
             self,
             n_samples,
@@ -230,15 +240,37 @@ class DDPMAbstract(Base):
             sample_source=sample_source,
         )
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def sample(
         self,
         n_samples: int | None = None,
         sample_source: torch.Tensor | None = None,
+        start_step: int | None = None,
+        guidance: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Generate samples by running the reverse DDPM process."""
-        x, _ = self._sample(n_samples, return_trajectory=False, sample_source=sample_source)
+        x, _ = self._sample(n_samples,
+                            return_trajectory=False,
+                            sample_source=sample_source,
+                            start_step=start_step,
+                            guidance=guidance)
         return x
+
+    @torch.no_grad()
+    def sample_trajectory(
+        self,
+        n_samples: int | None = None,
+        sample_source: torch.Tensor | None = None,
+        start_step: int | None = None,
+        guidance: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """Generate and stack every state of a reverse DDPM trajectory."""
+        _, trajectory = self._sample(n_samples,
+                                     return_trajectory=True,
+                                     sample_source=sample_source,
+                                     start_step=start_step,
+                                     guidance=guidance)
+        return torch.stack(trajectory, dim=1)
 
 
 class FlowAbstract(Base):

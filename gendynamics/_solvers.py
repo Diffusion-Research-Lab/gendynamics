@@ -1,5 +1,6 @@
 """Inference-time samplers for native gendynamics models."""
 
+from collections.abc import Callable
 from typing import Any
 import torch
 
@@ -249,20 +250,38 @@ def _ddim_timesteps(model_n_steps: int, n_steps: int | None, device: torch.devic
     return timesteps.round().to(dtype=torch.long).flip(0)
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def sample_ddpm(
     model: Any,
     n_samples: int | None = None,
     return_trajectory: bool = True,
     sample_source: torch.Tensor | None = None,
+    start_step: int | None = None,
+    guidance: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
     """Run the native reverse DDPM chain for a DDPM-like model."""
+    start_step = model._n_steps if start_step is None else int(start_step)
+    if not 1 <= start_step <= model._n_steps:
+        raise ValueError(f"start_step must be in [1, {model._n_steps}], got {start_step}.")
+    if start_step != model._n_steps and sample_source is None:
+        raise ValueError("sample_source is required when restarting before the initial DDPM step.")
+
     model._net.eval()
     n_samples, x = model._resolve_sample_source(n_samples, sample_source)
     trajectory = [x] if return_trajectory else None
 
-    for t in range(model._n_steps, 0, -1):
+    for t in range(start_step, 0, -1):
         t_idx = t - 1
+        direction = None
+        if guidance is not None:
+            time = torch.full((n_samples,),
+                              (model._n_steps - t) / model._n_steps,
+                              device=x.device,
+                              dtype=x.dtype)
+            direction = guidance(x, time)
+            if direction.shape != x.shape:
+                raise ValueError(f"guidance shape {tuple(direction.shape)} does not match sample shape {tuple(x.shape)}.")
+
         eps_hat = _ddpm_eps_hat(model, x, t, n_samples)
         scale = model._betas[t_idx] / torch.sqrt(1.0 - model._alpha_bar[t_idx])
         x = x - scale * eps_hat
@@ -270,6 +289,9 @@ def sample_ddpm(
 
         if t > 1:
             x = x + model._sigma_max * model._sqrt_post_var[t_idx] * torch.randn_like(x)
+        if direction is not None:
+            variance = model._sigma_max ** 2 * model._sqrt_post_var[t_idx].square()
+            x = x + variance * direction
         if trajectory is not None:
             trajectory.append(x)
 
