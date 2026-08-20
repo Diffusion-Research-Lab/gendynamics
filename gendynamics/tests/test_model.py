@@ -348,6 +348,43 @@ def test_ddpm_sample_dispatches_native_sampler():
     assert len(trajectory) == 4
 
 
+def test_ddpm_sample_trajectory_and_restart(monkeypatch):
+    monkeypatch.setattr(torch, "randn_like", torch.zeros_like)
+    model = DDPMV(net=_ZeroNet(), dim=2, n_steps=4)
+    source = torch.randn(3, 2)
+
+    trajectory = model.sample_trajectory(sample_source=source)
+    restarted = model.sample(sample_source=trajectory[:, 2], start_step=2)
+
+    assert trajectory.shape == (3, 5, 2)
+    assert torch.allclose(restarted, trajectory[:, -1])
+
+
+def test_ddpm_guidance_uses_reverse_variance(monkeypatch):
+    monkeypatch.setattr(torch, "randn_like", torch.zeros_like)
+    model = DDPMV(net=_ZeroNet(), dim=2, n_steps=2)
+    model._alpha_bar = torch.full((2,), 0.5)
+    model._alphas = torch.ones(2)
+    model._betas = torch.zeros(2)
+    model._sqrt_post_var = torch.tensor([0.0, 0.5])
+    times = []
+
+    def guidance(x, time):
+        times.append(time)
+        return torch.ones_like(x)
+
+    samples = model.sample(sample_source=torch.zeros(3, 2), guidance=guidance)
+
+    assert torch.allclose(samples, torch.full((3, 2), 0.25))
+    assert torch.equal(times[0], torch.zeros(3))
+    assert torch.equal(times[1], torch.full((3,), 0.5))
+
+
+def test_ddpm_restart_requires_a_state():
+    with pytest.raises(ValueError, match="sample_source"):
+        _ddpm(n_steps=4).sample(2, start_step=2)
+
+
 def test_ddpm_sample_accepts_explicit_sample_source():
     sample_source = torch.tensor([[0.0, 1.0], [2.0, 3.0]], dtype=torch.float64)
     m = DDPMEps(net=_ZeroNet(), dim=2, n_steps=3, sampler="ddpm", fdtype=torch.float32)
