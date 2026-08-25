@@ -4,14 +4,7 @@ import numpy as np
 import pytest
 import torch
 from gendynamics import DDPMV, DLPMEps, GaussianFlowEDM, GaussianFlowLinear
-from gendynamics.metrics import (
-    classifier_tv_lower_bound,
-    mmd_rbf,
-    model_est_err_curve,
-    model_est_jacobian_spectral_curve,
-    sliced_wasserstein,
-    tail_coverage_error,
-)
+from gendynamics.metrics import classifier_tv_lower_bound, mmd_rbf, model_est_err_curve, model_est_jacobian_spectral_curve, sliced_wasserstein, tail_coverage_error
 from .utils import _devices
 
 

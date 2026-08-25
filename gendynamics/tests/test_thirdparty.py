@@ -4,13 +4,7 @@ import pytest
 import torch
 from gendynamics.nn import MLPModel
 from gendynamics.thirdparty import DLPMEpsOrigin, FlowMatchingOrigin, ScoreSDEOrigin, TEDMOrigin
-from .utils import (
-    _make_dlpm_vendor,
-    _make_flow_matching_vendor,
-    _make_score_sde_vendor,
-    _make_tedm_vendor,
-    _make_tedm_vendor_package_layout,
-)
+from .utils import _make_dlpm_vendor, _make_flow_matching_vendor, _make_score_sde_vendor, _make_tedm_vendor, _make_tedm_vendor_package_layout
 
 
 class _ZeroNet(torch.nn.Module):
