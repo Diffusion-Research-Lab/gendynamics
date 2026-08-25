@@ -173,12 +173,8 @@ def train(
     if log_grad_norm:
         stats["grad_norm"] = []
 
-    logger.info(
-        f"train | epochs={n_epochs} bs={batch_size} lr={lr:g} schedule={lr_schedule} "
-        f"warmup_steps={warmup_steps} cosine_eta_min_ratio={cosine_eta_min_ratio:g} "
-        f"opt={'AdamW' if use_adamw else 'Adam'} "
-        f"wd={weight_decay:g} device={device} dtype={dtype} ckpt_dir={ckpt_dir}"
-    )
+    logger.info("train | epochs=%d bs=%d lr=%g schedule=%s opt=%s wd=%g device=%s",
+                n_epochs, batch_size, lr, lr_schedule, "AdamW" if use_adamw else "Adam", weight_decay, device)
 
     # Main optimization loop.
     last_epoch_loss = float("nan")
