@@ -33,6 +33,7 @@ def train(
     ckpt_dir: str | None = None,
     ckpt_freq_epochs: int = 10,
     ckpt_keep_last: int = 3,
+    validation_data: torch.Tensor | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Train a native gendynamics generative model and return diagnostics."""
     logger = logging.getLogger(__name__)
@@ -70,6 +71,8 @@ def train(
         raise TypeError(f"target_data must be a torch.Tensor, got {type(target_data)}")
     if source_data is not None and not isinstance(source_data, torch.Tensor):
         raise TypeError(f"source_data must be a torch.Tensor or None, got {type(source_data)}")
+    if validation_data is not None and not isinstance(validation_data, torch.Tensor):
+        raise TypeError(f"validation_data must be a torch.Tensor or None, got {type(validation_data)}")
     if not use_adamw and float(weight_decay) != 0.0:
         raise ValueError("weight_decay is only supported with AdamW in this trainer.")
 
@@ -96,6 +99,18 @@ def train(
         if source.size(-1) != target.size(-1):
             raise ValueError(f"source_data dim {source.size(-1)} != target_data dim {target.size(-1)}")
 
+    if validation_data is None:
+        validation = None
+    else:
+        validation = validation_data.detach()
+        if data_device is not None:
+            validation = validation.to(device=data_device)
+        validation = validation.contiguous()
+        if validation.size(0) == 0:
+            raise ValueError("validation_data is empty; at least one sample is required when provided.")
+        if validation.size(-1) != target.size(-1):
+            raise ValueError(f"validation_data dim {validation.size(-1)} != target_data dim {target.size(-1)}")
+
     dtype = target.dtype
     net = generative_model._net.to(device=device, dtype=dtype)
     net.train()
@@ -115,6 +130,7 @@ def train(
         )
 
     target_pin = bool(pin and target.device.type == "cpu" and torch.cuda.is_available())
+    validation_pin = bool(pin and validation is not None and validation.device.type == "cpu" and torch.cuda.is_available())
     steps_per_epoch = (len(target) + batch_size - 1) // batch_size
 
     # Optimizer and learning-rate schedule.
@@ -168,8 +184,11 @@ def train(
         "prefetch_factor": prefetch_factor,
         "stats_freq_epochs": stats_freq_epochs,
         "log_grad_norm": log_grad_norm,
+        "validation_samples": 0 if validation is None else len(validation),
     }
     stats: dict[str, list[float | int]] = {"epoch": [], "training_loss": []}
+    if validation is not None:
+        stats["validation_loss"] = []
     if log_grad_norm:
         stats["grad_norm"] = []
 
@@ -178,6 +197,7 @@ def train(
 
     # Main optimization loop.
     last_epoch_loss = float("nan")
+    last_validation_loss = float("nan")
     for epoch in range(n_epochs):
         epoch_idx = epoch + 1
         epoch_loss_sum: torch.Tensor | None = None
@@ -223,9 +243,40 @@ def train(
             else:
                 last_epoch_loss = float(epoch_loss_sum / epoch_loss_count)
 
+        if validation is not None and (should_record or should_log):
+            validation_loss = 0.0
+            net.eval()
+            rng_devices = ([device.index if device.index is not None else torch.cuda.current_device()]
+                           if device.type == "cuda" else [])
+            # Fixed diffusion noise makes changes in validation loss comparable across epochs.
+            with torch.inference_mode(), torch.random.fork_rng(devices=rng_devices):
+                torch.manual_seed(0)
+                for start in range(0, len(validation), batch_size):
+                    x = validation[start: start + batch_size]
+                    if validation_pin:
+                        x = x.pin_memory()
+                    x = x.to(device=device, dtype=dtype, non_blocking=validation_pin)
+
+                    z = None
+                    if source is not None:
+                        idx = torch.randint(0, source.size(0), (x.size(0),), device=source.device)
+                        z = source.index_select(0, idx)
+                        if source_pin:
+                            z = z.pin_memory()
+                        z = z.to(device=device, dtype=dtype, non_blocking=source_pin)
+
+                    loss = generative_model.loss(x, z=z)
+                    if loss.ndim != 0:
+                        raise ValueError(f"generative_model.loss must return a scalar, got shape {tuple(loss.shape)}")
+                    validation_loss += float(loss) * len(x)
+            last_validation_loss = validation_loss / len(validation)
+            net.train()
+
         if should_record:
             stats["epoch"].append(epoch_idx)
             stats["training_loss"].append(last_epoch_loss)
+            if validation is not None:
+                stats["validation_loss"].append(last_validation_loss)
             if log_grad_norm:
                 grad_sq_sum = 0.0
                 for param in net.parameters():
@@ -236,7 +287,8 @@ def train(
 
         if should_log:
             lr_now = opt.param_groups[0]["lr"]
-            logger.info(f"epoch {epoch_idx:3d}/{n_epochs:3d} | loss {last_epoch_loss:.6f} | lr {lr_now:.3e}")
+            validation_log = f" | validation {last_validation_loss:.6f}" if validation is not None else ""
+            logger.info(f"epoch {epoch_idx:3d}/{n_epochs:3d} | loss {last_epoch_loss:.6f}{validation_log} | lr {lr_now:.3e}")
 
         if should_checkpoint:
             _save_ckpt(ckpt_path, ckpt_keep_last, epoch_idx, epoch_idx * steps_per_epoch,

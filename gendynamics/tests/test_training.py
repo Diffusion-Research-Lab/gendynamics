@@ -62,6 +62,16 @@ def test_train_stats_frequency_records_final_epoch():
     assert len(diagnostics["stats"]["training_loss"]) == 3
 
 
+def test_train_records_validation_loss():
+    x = torch.randn(96, 3, dtype=torch.float32)
+    validation = torch.randn(24, 3, dtype=torch.float32)
+    _, diagnostics = _run_train(x, n_epochs=3, validation_data=validation)
+
+    assert diagnostics["train_config"]["validation_samples"] == 24
+    assert len(diagnostics["stats"]["validation_loss"]) == 3
+    assert torch.isfinite(torch.tensor(diagnostics["stats"]["validation_loss"])).all().item()
+
+
 def test_train_can_log_grad_norm_when_requested():
     x = torch.randn(96, 3, dtype=torch.float32)
     _, diagnostics = _run_train(x, n_epochs=3, log_grad_norm=True)
