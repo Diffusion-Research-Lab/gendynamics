@@ -72,6 +72,20 @@ def test_train_records_validation_loss():
     assert torch.isfinite(torch.tensor(diagnostics["stats"]["validation_loss"])).all().item()
 
 
+def test_train_can_restore_best_validation_weights():
+    torch.manual_seed(0)
+    x = torch.randn(96, 3, dtype=torch.float32)
+    validation = torch.randn(24, 3, dtype=torch.float32)
+    model, diagnostics = _run_train(x, n_epochs=8, lr=0.05, validation_data=validation, restore_best=True)
+
+    with torch.inference_mode():
+        restored_loss = float(model.loss(validation))
+
+    assert diagnostics["train_config"]["restore_best"] is True
+    assert diagnostics["stats"]["best_epoch"] in range(1, 9)
+    assert restored_loss == pytest.approx(diagnostics["stats"]["best_validation_loss"], rel=1e-6)
+
+
 def test_train_can_log_grad_norm_when_requested():
     x = torch.randn(96, 3, dtype=torch.float32)
     _, diagnostics = _run_train(x, n_epochs=3, log_grad_norm=True)

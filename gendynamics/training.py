@@ -34,6 +34,7 @@ def train(
     ckpt_freq_epochs: int = 10,
     ckpt_keep_last: int = 3,
     validation_data: torch.Tensor | None = None,
+    restore_best: bool = False,
 ) -> tuple[Any, dict[str, Any]]:
     """Train a native gendynamics generative model and return diagnostics."""
     logger = logging.getLogger(__name__)
@@ -73,6 +74,8 @@ def train(
         raise TypeError(f"source_data must be a torch.Tensor or None, got {type(source_data)}")
     if validation_data is not None and not isinstance(validation_data, torch.Tensor):
         raise TypeError(f"validation_data must be a torch.Tensor or None, got {type(validation_data)}")
+    if restore_best and validation_data is None:
+        raise ValueError("restore_best requires validation_data.")
     if not use_adamw and float(weight_decay) != 0.0:
         raise ValueError("weight_decay is only supported with AdamW in this trainer.")
 
@@ -185,8 +188,9 @@ def train(
         "stats_freq_epochs": stats_freq_epochs,
         "log_grad_norm": log_grad_norm,
         "validation_samples": 0 if validation is None else len(validation),
+        "restore_best": restore_best,
     }
-    stats: dict[str, list[float | int]] = {"epoch": [], "training_loss": []}
+    stats: dict[str, Any] = {"epoch": [], "training_loss": []}
     if validation is not None:
         stats["validation_loss"] = []
     if log_grad_norm:
@@ -198,6 +202,7 @@ def train(
     # Main optimization loop.
     last_epoch_loss = float("nan")
     last_validation_loss = float("nan")
+    best_epoch, best_validation_loss, best_state = 0, float("inf"), None
     for epoch in range(n_epochs):
         epoch_idx = epoch + 1
         epoch_loss_sum: torch.Tensor | None = None
@@ -270,6 +275,10 @@ def train(
                         raise ValueError(f"generative_model.loss must return a scalar, got shape {tuple(loss.shape)}")
                     validation_loss += float(loss) * len(x)
             last_validation_loss = validation_loss / len(validation)
+            if last_validation_loss < best_validation_loss:
+                best_epoch, best_validation_loss = epoch_idx, last_validation_loss
+                if restore_best:
+                    best_state = {name: value.detach().clone() for name, value in net.state_dict().items()}
             net.train()
 
         if should_record:
@@ -293,6 +302,12 @@ def train(
         if should_checkpoint:
             _save_ckpt(ckpt_path, ckpt_keep_last, epoch_idx, epoch_idx * steps_per_epoch,
                        last_epoch_loss, net, opt, scheduler, train_config)
+
+    if validation is not None:
+        stats.update({"best_epoch": best_epoch, "best_validation_loss": best_validation_loss})
+    if best_state is not None:
+        net.load_state_dict(best_state)
+        logger.info("train | restored best validation weights from epoch %d", best_epoch)
 
     if ckpt_path is not None:
         _save_ckpt(ckpt_path, ckpt_keep_last, n_epochs, n_epochs * steps_per_epoch,
