@@ -86,6 +86,18 @@ def test_train_can_restore_best_validation_weights():
     assert restored_loss == pytest.approx(diagnostics["stats"]["best_validation_loss"], rel=1e-6)
 
 
+def test_train_can_stop_after_validation_stalls():
+    x = torch.randn(96, 3, dtype=torch.float32)
+    validation = torch.randn(24, 3, dtype=torch.float32)
+    _, diagnostics = _run_train(
+        x, n_epochs=10, lr=0.0, validation_data=validation,
+        early_stopping_patience=2, restore_best=True,
+    )
+
+    assert diagnostics["stats"]["epoch"] == [1, 2, 3]
+    assert diagnostics["stats"]["best_epoch"] == 1
+
+
 def test_train_can_log_grad_norm_when_requested():
     x = torch.randn(96, 3, dtype=torch.float32)
     _, diagnostics = _run_train(x, n_epochs=3, log_grad_norm=True)

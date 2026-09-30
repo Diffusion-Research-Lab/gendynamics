@@ -35,6 +35,8 @@ def train(
     ckpt_keep_last: int = 3,
     validation_data: torch.Tensor | None = None,
     restore_best: bool = False,
+    early_stopping_patience: int | None = None,
+    early_stopping_min_delta: float = 0.0,
 ) -> tuple[Any, dict[str, Any]]:
     """Train a native gendynamics generative model and return diagnostics."""
     logger = logging.getLogger(__name__)
@@ -58,6 +60,8 @@ def train(
     if ckpt_freq_epochs < 1:
         raise ValueError("ckpt_freq_epochs must be >= 1.")
     ckpt_keep_last = int(ckpt_keep_last)
+    early_stopping_patience = None if early_stopping_patience is None else int(early_stopping_patience)
+    early_stopping_min_delta = float(early_stopping_min_delta)
     if isinstance(log_grad_norm, str):
         log_grad_norm = log_grad_norm.lower().strip() in {"1", "true", "yes", "y", "on"}
     else:
@@ -76,6 +80,13 @@ def train(
         raise TypeError(f"validation_data must be a torch.Tensor or None, got {type(validation_data)}")
     if restore_best and validation_data is None:
         raise ValueError("restore_best requires validation_data.")
+    if early_stopping_patience is not None:
+        if early_stopping_patience < 1:
+            raise ValueError("early_stopping_patience must be >= 1.")
+        if validation_data is None:
+            raise ValueError("early_stopping_patience requires validation_data.")
+    if early_stopping_min_delta < 0.0:
+        raise ValueError("early_stopping_min_delta must be non-negative.")
     if not use_adamw and float(weight_decay) != 0.0:
         raise ValueError("weight_decay is only supported with AdamW in this trainer.")
 
@@ -189,6 +200,8 @@ def train(
         "log_grad_norm": log_grad_norm,
         "validation_samples": 0 if validation is None else len(validation),
         "restore_best": restore_best,
+        "early_stopping_patience": early_stopping_patience,
+        "early_stopping_min_delta": early_stopping_min_delta,
     }
     stats: dict[str, Any] = {"epoch": [], "training_loss": []}
     if validation is not None:
@@ -203,6 +216,7 @@ def train(
     last_epoch_loss = float("nan")
     last_validation_loss = float("nan")
     best_epoch, best_validation_loss, best_state = 0, float("inf"), None
+    epochs_without_improvement = 0
     for epoch in range(n_epochs):
         epoch_idx = epoch + 1
         epoch_loss_sum: torch.Tensor | None = None
@@ -275,10 +289,13 @@ def train(
                         raise ValueError(f"generative_model.loss must return a scalar, got shape {tuple(loss.shape)}")
                     validation_loss += float(loss) * len(x)
             last_validation_loss = validation_loss / len(validation)
-            if last_validation_loss < best_validation_loss:
+            if last_validation_loss < best_validation_loss - early_stopping_min_delta:
                 best_epoch, best_validation_loss = epoch_idx, last_validation_loss
+                epochs_without_improvement = 0
                 if restore_best:
                     best_state = {name: value.detach().clone() for name, value in net.state_dict().items()}
+            else:
+                epochs_without_improvement += 1
             net.train()
 
         if should_record:
@@ -299,6 +316,11 @@ def train(
             validation_log = f" | validation {last_validation_loss:.6f}" if validation is not None else ""
             logger.info(f"epoch {epoch_idx:3d}/{n_epochs:3d} | loss {last_epoch_loss:.6f}{validation_log} | lr {lr_now:.3e}")
 
+        if early_stopping_patience is not None and epochs_without_improvement >= early_stopping_patience:
+            logger.info("train | early stop at epoch %d | best epoch %d | validation %.6f",
+                        epoch_idx, best_epoch, best_validation_loss)
+            break
+
         if should_checkpoint:
             _save_ckpt(ckpt_path, ckpt_keep_last, epoch_idx, epoch_idx * steps_per_epoch,
                        last_epoch_loss, net, opt, scheduler, train_config)
@@ -310,7 +332,7 @@ def train(
         logger.info("train | restored best validation weights from epoch %d", best_epoch)
 
     if ckpt_path is not None:
-        _save_ckpt(ckpt_path, ckpt_keep_last, n_epochs, n_epochs * steps_per_epoch,
+        _save_ckpt(ckpt_path, ckpt_keep_last, epoch_idx, epoch_idx * steps_per_epoch,
                    last_epoch_loss, net, opt, scheduler, train_config)
 
     logger.info("train | done")
