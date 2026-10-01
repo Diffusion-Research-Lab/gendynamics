@@ -145,6 +145,23 @@ def test_train_tiny_dataset_with_large_batch_still_trains():
     assert torch.isfinite(torch.tensor(diagnostics["stats"]["training_loss"])).all().item()
 
 
+def test_train_rejects_bfloat16_amp_without_supported_cuda():
+    x = torch.randn(8, 2, dtype=torch.float32)
+    with pytest.raises(ValueError, match="BF16 support"):
+        _run_train(x, amp_dtype="bfloat16")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(),
+                    reason="CUDA BF16 support is required")
+def test_train_bfloat16_amp_keeps_float32_parameters():
+    x = torch.randn(16, 2, dtype=torch.float32)
+    model, diagnostics = train(_DummyGenerativeModel(dim=2), target_data=x, validation_data=x,
+                               batch_size=8, n_epochs=1, lr=1e-3, device="cuda", amp_dtype="bfloat16")
+    assert diagnostics["train_config"]["amp_dtype"] == "bfloat16"
+    assert all(parameter.dtype == torch.float32 for parameter in model._net.parameters())
+    assert torch.isfinite(torch.tensor(diagnostics["stats"]["validation_loss"])).all()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for CUDA data-device contract")
 def test_train_preserves_cuda_target_data_by_default():
     x = torch.randn(16, 2, device="cuda", dtype=torch.float32)

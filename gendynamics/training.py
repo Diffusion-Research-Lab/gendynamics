@@ -37,6 +37,7 @@ def train(
     restore_best: bool = False,
     early_stopping_patience: int | None = None,
     early_stopping_min_delta: float = 0.0,
+    amp_dtype: str | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Train a native gendynamics generative model and return diagnostics."""
     logger = logging.getLogger(__name__)
@@ -92,6 +93,13 @@ def train(
 
     # Stage tensors without silently forcing them back to CPU.
     device = torch.device(device)
+    if amp_dtype not in (None, "bfloat16"):
+        raise ValueError("amp_dtype must be None or 'bfloat16'.")
+    use_bf16_amp = amp_dtype == "bfloat16"
+    if use_bf16_amp and (device.type != "cuda" or not torch.cuda.is_bf16_supported()):
+        raise ValueError("bfloat16 autocast requires a CUDA device with BF16 support.")
+    if use_bf16_amp and target_data.dtype != torch.float32:
+        raise ValueError("bfloat16 autocast requires float32 data and model parameters.")
     data_device = None if data_device is None else torch.device(data_device)
 
     target = target_data.detach()
@@ -190,6 +198,7 @@ def train(
         "use_adamw": use_adamw,
         "grad_clip_norm": grad_clip_norm,
         "dtype": str(dtype),
+        "amp_dtype": amp_dtype,
         "device": str(device),
         "data_device": str(target.device),
         "pin_memory": pin,
@@ -209,8 +218,9 @@ def train(
     if log_grad_norm:
         stats["grad_norm"] = []
 
-    logger.info("train | epochs=%d bs=%d lr=%g schedule=%s opt=%s wd=%g device=%s",
-                n_epochs, batch_size, lr, lr_schedule, "AdamW" if use_adamw else "Adam", weight_decay, device)
+    logger.info("train | epochs=%d bs=%d lr=%g schedule=%s opt=%s wd=%g device=%s amp=%s",
+                n_epochs, batch_size, lr, lr_schedule, "AdamW" if use_adamw else "Adam", weight_decay,
+                device, amp_dtype or "off")
 
     # Main optimization loop.
     last_epoch_loss = float("nan")
@@ -238,7 +248,9 @@ def train(
                 z = z.to(device=device, dtype=dtype, non_blocking=source_pin)
 
             opt.zero_grad(set_to_none=True)
-            loss = generative_model.loss(x, z=z)
+            # BF16 autocast keeps FP32 parameters and AdamW state; its exponent range needs no loss scaler.
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16_amp):
+                loss = generative_model.loss(x, z=z)
             if loss.ndim != 0:
                 raise ValueError(f"generative_model.loss must return a scalar, got shape {tuple(loss.shape)}")
             loss.backward()
@@ -284,7 +296,8 @@ def train(
                             z = z.pin_memory()
                         z = z.to(device=device, dtype=dtype, non_blocking=source_pin)
 
-                    loss = generative_model.loss(x, z=z)
+                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16_amp):
+                        loss = generative_model.loss(x, z=z)
                     if loss.ndim != 0:
                         raise ValueError(f"generative_model.loss must return a scalar, got shape {tuple(loss.shape)}")
                     validation_loss += float(loss) * len(x)
