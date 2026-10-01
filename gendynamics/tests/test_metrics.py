@@ -39,6 +39,16 @@ def test_sliced_wasserstein_translation_formula(device, dtype):
 
 
 @pytest.mark.parametrize("device", _devices())
+def test_sliced_wasserstein_order_one(device):
+    x = torch.randn(128, 1, device=device, generator=torch.Generator(device=device).manual_seed(0))
+
+    assert sliced_wasserstein(x, x, n_projections=16, seed=123, p=1) == 0.0
+    assert sliced_wasserstein(x, x + 2, n_projections=16, seed=123, p=1) == pytest.approx(2.0)
+    with pytest.raises(ValueError, match="p must be at least 1"):
+        sliced_wasserstein(x, x, p=0)
+
+
+@pytest.mark.parametrize("device", _devices())
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_mmd_rbf_near_zero_for_identical_samples(device, dtype):
     torch.manual_seed(0)

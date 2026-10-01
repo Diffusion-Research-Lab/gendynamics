@@ -103,8 +103,8 @@ def mmd_rbf(x_ref, x_gen, gamma=None, estimator="biased"):
     return float(mmd2.item())
 
 
-def sliced_wasserstein(x_ref, x_gen, n_projections=128, n_grid=1000, eps=1e-12, seed=None):
-    """Compute the sliced squared 2-Wasserstein distance."""
+def sliced_wasserstein(x_ref, x_gen, n_projections=128, n_grid=1000, eps=1e-12, seed=None, p=2):
+    """Compute the p-th power of sliced p-Wasserstein distance."""
     n_grid = int(n_grid)
     x_ref = _to_2d_tensor(x_ref)
     x_gen = _to_2d_tensor(x_gen, device=x_ref.device, dtype=x_ref.dtype)
@@ -113,6 +113,8 @@ def sliced_wasserstein(x_ref, x_gen, n_projections=128, n_grid=1000, eps=1e-12, 
         raise ValueError("n_projections must be at least 1.")
     if n_grid < 2:
         raise ValueError("n_grid must be at least 2.")
+    if p < 1:
+        raise ValueError("p must be at least 1.")
 
     d = x_ref.shape[1]
     generator = None if seed is None else torch.Generator(device=x_ref.device).manual_seed(seed)
@@ -123,7 +125,7 @@ def sliced_wasserstein(x_ref, x_gen, n_projections=128, n_grid=1000, eps=1e-12, 
     q = torch.linspace(0.0, 1.0 - float(eps), n_grid, device=x_ref.device, dtype=x_ref.dtype)
     q_ref = torch.quantile(proj_ref, q, dim=0)
     q_gen = torch.quantile(proj_gen, q, dim=0)
-    return float(torch.trapz((q_ref - q_gen).pow(2), q, dim=0).mean().item())
+    return float(torch.trapz((q_ref - q_gen).abs().pow(p), q, dim=0).mean().item())
 
 
 def classifier_tv_lower_bound(
