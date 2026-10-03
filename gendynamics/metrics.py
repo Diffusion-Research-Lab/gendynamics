@@ -9,11 +9,17 @@ from .flow_matching import GaussianFlowDDPM, GaussianFlowEDM, GaussianFlowLinear
 
 __all__ = [
     "classifier_tv_lower_bound",
+    "maximum_event",
+    "maximum_event_tail_coverage_error",
     "model_est_err_curve",
     "model_est_jacobian_spectral_curve",
     "mmd_rbf",
+    "mmd_reference_gamma",
     "sliced_wasserstein",
+    "tail_coverage_area",
+    "tail_coverage_curve",
     "tail_coverage_error",
+    "tail_coverage_reference",
 ]
 
 
@@ -43,6 +49,12 @@ def _validate_same_feature_dim(x_ref, x_gen):
         raise ValueError("x_ref and x_gen must have the same feature dimension.")
 
 
+def maximum_event(x, *, absolute=False):
+    """Return each sample's largest coordinate, or largest magnitude if ``absolute``."""
+    x = _to_2d_tensor(x, dtype=None)
+    return (x.abs() if absolute else x).amax(dim=1, keepdim=True)
+
+
 def _rbf_kernel_matrix(x, y, gamma):
     """Evaluate an RBF kernel matrix."""
     return torch.exp(-float(gamma) * torch.cdist(x, y, p=2).pow(2))
@@ -57,6 +69,16 @@ def _median_heuristic_gamma(x_ref, x_gen):
         return 1.0
     median_d2 = torch.median(positive)
     return float(0.5 / median_d2.clamp_min(torch.finfo(z.dtype).eps).item())
+
+
+def mmd_reference_gamma(x_ref):
+    """Set one RBF bandwidth from reference pairs, independent of compared methods."""
+    x_ref = _to_2d_tensor(x_ref)
+    if len(x_ref) < 2:
+        raise ValueError("mmd_reference_gamma requires at least two reference samples")
+    distances = torch.pdist(x_ref).square()
+    positive = distances[distances > 0]
+    return float(0.5 / positive.median()) if len(positive) else 1.0
 
 
 def _default_tail_probs(n, *, device, dtype, min_exceedances=10):
@@ -236,52 +258,100 @@ def classifier_tv_lower_bound(
     return max(0.0, min(1.0, 2.0 * balanced_accuracy - 1.0))
 
 
-def _tail_coverage_curve(x_ref, x_gen, probs=None, tail="upper", min_exceedances=10):
-    """Tail exceedance calibration at reference thresholds."""
-    x_ref = _to_2d_tensor(x_ref)
-    x_gen = _to_2d_tensor(x_gen, device=x_ref.device, dtype=x_ref.dtype)
-    _validate_same_feature_dim(x_ref, x_gen)
-
-    if probs is None:
-        probs = _default_tail_probs(min(int(x_ref.shape[0]), int(x_gen.shape[0])), device=x_ref.device,
-                                    dtype=x_ref.dtype, min_exceedances=min_exceedances)
-    else:
-        probs = _to_2d_tensor(probs, device=x_ref.device, dtype=x_ref.dtype).reshape(-1)
-        if torch.any((probs <= 0) | (probs >= 1)):
-            raise ValueError("probs must satisfy 0 < probs < 1")
-
+def tail_coverage_reference(x_ref, probs, *, feature_block=16, tail="upper", absolute=False):
+    """Cache reference thresholds and exceedance masses in feature blocks."""
+    x_ref = _to_2d_tensor(x_ref, dtype=None)
+    probs = _to_tensor(probs, device=x_ref.device, dtype=torch.float64).reshape(-1)
+    if probs.numel() == 0 or torch.any((probs <= 0) | (probs >= 1)):
+        raise ValueError("probs must satisfy 0 < probs < 1")
     if tail not in {"upper", "lower"}:
         raise ValueError("tail must be 'upper' or 'lower'")
+    if feature_block < 1:
+        raise ValueError("feature_block must be positive")
 
-    quantiles = 1.0 - probs if tail == "upper" else probs
-    thresholds = torch.quantile(x_ref, quantiles, dim=0)
-    if tail == "upper":
-        ref_coverage = (x_ref.unsqueeze(0) > thresholds.unsqueeze(1)).double().mean(dim=1)
-        gen_coverage = (x_gen.unsqueeze(0) > thresholds.unsqueeze(1)).double().mean(dim=1)
-    else:
-        ref_coverage = (x_ref.unsqueeze(0) < thresholds.unsqueeze(1)).double().mean(dim=1)
-        gen_coverage = (x_gen.unsqueeze(0) < thresholds.unsqueeze(1)).double().mean(dim=1)
+    cache = []
+    for start in range(0, x_ref.shape[1], feature_block):
+        values = x_ref[:, start:start + feature_block].double()
+        if absolute:
+            values = values.abs()
+        thresholds = torch.quantile(values, 1 - probs if tail == "upper" else probs, dim=0).T.contiguous()
+        ordered = values.T.contiguous().sort(dim=1).values
+        ranks = torch.searchsorted(ordered, thresholds, right=tail == "upper")
+        masses = (len(values) - ranks if tail == "upper" else ranks).double() / len(values)
+        cache.append((thresholds, masses))
+    return cache
 
-    return probs, ref_coverage, gen_coverage
+
+def tail_coverage_curve(x_gen, reference_cache, *, mode="log", reduction="features", tail="upper", absolute=False, eps=1e-12):
+    """Compare generated tail mass with cached reference mass without a sample-by-probability tensor.
+
+    ``signed_log`` returns log(Q/P); negative values indicate undercoverage.
+    """
+    if not reference_cache:
+        raise ValueError("reference_cache must be non-empty")
+    if tail not in {"upper", "lower"}:
+        raise ValueError("tail must be 'upper' or 'lower'")
+    if eps <= 0:
+        raise ValueError("eps must be positive")
+    x_gen = _to_2d_tensor(x_gen, device=reference_cache[0][0].device, dtype=None)
+    if x_gen.shape[1] != sum(len(thresholds) for thresholds, _ in reference_cache):
+        raise ValueError("x_gen and reference_cache must have the same feature dimension")
+
+    blocks = []
+    start = 0
+    for thresholds, ref_mass in reference_cache:
+        width = len(thresholds)
+        values = x_gen[:, start:start + width].double()
+        if absolute:
+            values = values.abs()
+        ordered = values.T.contiguous().sort(dim=1).values
+        ranks = torch.searchsorted(ordered, thresholds, right=tail == "upper")
+        gen_mass = (len(values) - ranks if tail == "upper" else ranks).double() / len(values)
+        if mode in {"log", "signed_log"}:
+            difference = torch.log(gen_mass + eps) - torch.log(ref_mass + eps)
+            blocks.append(difference.abs() if mode == "log" else difference)
+        elif mode == "abs":
+            blocks.append((gen_mass - ref_mass).abs())
+        else:
+            raise ValueError("mode must be 'log', 'signed_log', or 'abs'")
+        start += width
+
+    values = torch.cat(blocks, dim=0).T
+    if reduction == "none":
+        return values
+    if reduction == "features":
+        return values.mean(dim=1)
+    if reduction == "mean":
+        return float(values.mean().item())
+    raise ValueError("reduction must be 'none', 'features', or 'mean'")
+
+
+def tail_coverage_area(curves, probs):
+    """Integrate tail curves against the reference-quantile logit, preserving leading dimensions."""
+    curves = _to_tensor(curves)
+    probs = _to_tensor(probs, device=curves.device).reshape(-1)
+    if len(probs) < 2 or curves.shape[-1] != len(probs) or torch.any((probs <= 0) | (probs >= 1)):
+        raise ValueError("curves require at least two matching probabilities in (0, 1)")
+    return torch.trapezoid(curves, torch.logit(1 - probs), dim=-1)
 
 
 def tail_coverage_error(x_ref, x_gen, probs=None, tail="upper", min_exceedances=10, mode="log", reduction="mean", eps=1e-12):
     """Aggregate marginal tail-coverage mismatch over tail probabilities and features."""
-    _, ref_cov, gen_cov = _tail_coverage_curve(x_ref, x_gen, probs=probs, tail=tail,
-                                               min_exceedances=min_exceedances)
+    x_ref = _to_2d_tensor(x_ref)
+    x_gen = _to_2d_tensor(x_gen, device=x_ref.device)
+    _validate_same_feature_dim(x_ref, x_gen)
+    if probs is None:
+        probs = _default_tail_probs(min(len(x_ref), len(x_gen)), device=x_ref.device,
+                                    dtype=torch.float64, min_exceedances=min_exceedances)
+    cache = tail_coverage_reference(x_ref, probs, tail=tail)
+    return tail_coverage_curve(x_gen, cache, mode=mode, reduction=reduction, tail=tail, eps=eps)
 
-    if mode == "log":
-        err = (torch.log(gen_cov + float(eps)) - torch.log(ref_cov + float(eps))).abs()
-    elif mode == "abs":
-        err = (gen_cov - ref_cov).abs()
-    else:
-        raise ValueError("mode must be 'log' or 'abs'")
 
-    if reduction == "mean":
-        return float(err.mean().item())
-    if reduction == "none":
-        return err
-    raise ValueError("reduction must be 'mean' or 'none'")
+def maximum_event_tail_coverage_error(x_ref, x_gen, probs=None, *, absolute=False, reduction="mean", min_exceedances=10):
+    """Tail-coverage error of the largest coordinate or largest magnitude per sample."""
+    return tail_coverage_error(maximum_event(x_ref, absolute=absolute),
+                               maximum_event(x_gen, absolute=absolute), probs=probs,
+                               reduction=reduction, min_exceedances=min_exceedances)
 
 
 def _require_family(gen_model: object) -> str:

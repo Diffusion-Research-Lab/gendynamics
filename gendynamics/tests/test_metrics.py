@@ -4,7 +4,10 @@ import numpy as np
 import pytest
 import torch
 from gendynamics import DDPMV, DLPMEps, GaussianFlowEDM, GaussianFlowLinear
-from gendynamics.metrics import classifier_tv_lower_bound, mmd_rbf, model_est_err_curve, model_est_jacobian_spectral_curve, sliced_wasserstein, tail_coverage_error
+from gendynamics.metrics import (classifier_tv_lower_bound, maximum_event, maximum_event_tail_coverage_error,
+                                 mmd_rbf, mmd_reference_gamma, model_est_err_curve,
+                                 model_est_jacobian_spectral_curve, sliced_wasserstein,
+                                 tail_coverage_area, tail_coverage_curve, tail_coverage_error, tail_coverage_reference)
 from .utils import _devices
 
 
@@ -87,6 +90,14 @@ def test_mmd_rbf_supports_biased_and_unbiased_estimators(device, dtype):
     assert isinstance(score_unbiased, float)
     assert score_biased >= 0.0
     assert torch.isfinite(torch.tensor(score_unbiased)).item()
+
+
+def test_reference_mmd_bandwidth_uses_only_reference_pairs():
+    reference = torch.tensor([[0.0], [1.0], [3.0]])
+    assert mmd_reference_gamma(reference) == pytest.approx(0.125)
+    assert mmd_reference_gamma(torch.ones(3, 1)) == 1.0
+    with pytest.raises(ValueError, match="at least two"):
+        mmd_reference_gamma(reference[:1])
 
 
 def test_classifier_tv_lower_bound_near_zero_for_identical_distributions():
@@ -201,6 +212,55 @@ def test_tce_lower_tail_detects_lighter_left_tail(device, dtype):
 
     assert isinstance(score, float)
     assert score > 0.0
+
+
+@pytest.mark.parametrize("device", _devices())
+def test_cached_tail_curves_match_tce_and_keep_signed_direction(device):
+    reference = torch.arange(100, device=device).double()[:, None].repeat(1, 3)
+    probabilities = torch.tensor([0.2, 0.1, 0.05], device=device)
+    cache = tail_coverage_reference(reference, probabilities, feature_block=2)
+    high = tail_coverage_curve(reference + 10, cache, mode="signed_log")
+    low = tail_coverage_curve(reference - 10, cache, mode="signed_log")
+
+    assert torch.all(high > 0)
+    assert torch.all(low < 0)
+    torch.testing.assert_close(high.abs(), tail_coverage_curve(reference + 10, cache, mode="log"))
+    torch.testing.assert_close(tail_coverage_curve(reference, cache), torch.zeros_like(high))
+    torch.testing.assert_close(tail_coverage_curve(reference + 10, cache, reduction="none"),
+                               tail_coverage_error(reference, reference + 10, probs=probabilities, reduction="none"))
+
+
+def test_cached_tail_curves_support_lower_tail_absolute_values_and_area():
+    reference = torch.arange(-50, 50).double()[:, None]
+    probabilities = torch.tensor([0.2, 0.1, 0.05])
+    cache = tail_coverage_reference(reference, probabilities, tail="lower", absolute=True)
+    curve = tail_coverage_curve(reference * 0.5, cache, tail="lower", absolute=True, mode="signed_log")
+
+    assert curve.shape == (3,)
+    assert torch.isfinite(curve).all()
+    torch.testing.assert_close(tail_coverage_area(curve[None, :], probabilities)[0],
+                               torch.trapezoid(curve, torch.logit(1 - probabilities.double())))
+
+
+def test_tce_accepts_integer_samples_with_default_probabilities():
+    reference = torch.arange(100)
+    assert tail_coverage_error(reference, reference) == 0.0
+
+
+def test_maximum_event_distinguishes_signed_and_absolute_extremes():
+    samples = torch.tensor([[-3.0, 1.0], [1.0, 2.0]])
+    torch.testing.assert_close(maximum_event(samples), torch.tensor([[1.0], [2.0]]))
+    torch.testing.assert_close(maximum_event(samples, absolute=True), torch.tensor([[3.0], [2.0]]))
+
+
+def test_maximum_event_tce_matches_scalar_tail_coverage():
+    reference = torch.arange(100).float()[:, None].repeat(1, 2)
+    generated = reference + torch.tensor([-20.0, 10.0])
+    probabilities = torch.tensor([0.2, 0.1])
+    curve = maximum_event_tail_coverage_error(reference, generated, probabilities, absolute=True, reduction="features")
+    expected = tail_coverage_error(maximum_event(reference, absolute=True),
+                                   maximum_event(generated, absolute=True), probabilities, reduction="features")
+    torch.testing.assert_close(curve, expected)
 
 
 class _LinearTimeNet(torch.nn.Module):
