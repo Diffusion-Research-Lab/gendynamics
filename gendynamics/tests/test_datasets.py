@@ -96,3 +96,17 @@ def test_bimodal_gaussian_datasets_are_not_registered():
 def test_fetch_synthetic_data_unknown_name_raises_key_error():
     with pytest.raises(KeyError, match="no_such_dataset"):
         fetch_synthetic_data("no_such_dataset")
+
+
+def test_gaussian_mixture_registry_accepts_weights_and_scales():
+    import json
+
+    torch.manual_seed(7)
+    training, validation, test, metadata = fetch_synthetic_data(
+        'unbalanced_highdim_gaussian_mixture', n_samples=100, dim=4, n_modes=3,
+        weights=torch.tensor([0.6, 0.3, 0.1]), std_range=(0.2, 0.8),
+        val_size=0.2, test_size=0.2, return_metadata=True)
+    assert [len(training), len(validation), len(test)] == [60, 20, 20]
+    assert metadata['request']['params']['std_range'] == [0.2, 0.8]
+    assert len(metadata['request']['params']['weights']) == 3
+    json.dumps(metadata)

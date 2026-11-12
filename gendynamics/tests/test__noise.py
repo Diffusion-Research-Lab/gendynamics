@@ -30,6 +30,25 @@ def _cov(x: torch.Tensor) -> torch.Tensor:
     return (x.T @ x) / float(x.shape[0] - 1)
 
 
+def test_gaussian_mixture_supports_custom_weights_and_component_scales(monkeypatch):
+    import gendynamics._noise as noise
+
+    centers = torch.tensor([[-20., 0.], [20., 0.]], dtype=torch.float64)
+    directions = torch.eye(2, dtype=torch.float64)
+    monkeypatch.setattr(noise, '_unbalanced_highdim_mixture_structure',
+                        lambda **kwargs: (centers, directions, torch.zeros(kwargs['n_samples'], dtype=torch.long)))
+    torch.manual_seed(3)
+    samples = sample_unbalanced_highdim_gaussian_mixture(40_000, 2, n_modes=2, weights=[9., 1.],
+                                                         std_range=(0.2, 0.8), anisotropy=3.0, dtype=torch.float64)
+    modes = (samples[:, 0] > 0).long()
+    assert abs(float(modes.double().mean()) - 0.1) < 0.01
+    for mode, scale in enumerate((0.2, 0.8)):
+        expected = scale ** 2 * (torch.eye(2) + 9 * torch.outer(directions[mode], directions[mode]))
+        torch.testing.assert_close(_cov(samples[modes == mode]), expected, rtol=0.08, atol=0.03)
+    with pytest.raises(ValueError, match='weights'):
+        sample_unbalanced_highdim_gaussian_mixture(10, 2, n_modes=2, weights=[1., 0.])
+
+
 def test_sample_gaussian_mean_cov_identity_cpu():
     torch.manual_seed(0)
     n, d = 30000, 5

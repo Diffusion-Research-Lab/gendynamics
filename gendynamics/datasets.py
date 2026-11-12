@@ -51,6 +51,8 @@ class DatasetEntry:
 
 
 def _metadata_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
     if isinstance(value, dict):
         return {str(key): _metadata_value(val) for key, val in value.items()}
     if isinstance(value, (list, tuple)):
@@ -247,6 +249,8 @@ SYNTHETIC_DATASETS: dict[str, DatasetEntry] = {
             "imbalance_tau": lambda kwargs: float(_getpop(kwargs, "imbalance_tau", 1.2)),
             "mean_scale": lambda kwargs: float(_getpop(kwargs, "mean_scale", 7.5)),
             "base_std": lambda kwargs: float(_getpop(kwargs, "base_std", 0.55)),
+            "weights": lambda kwargs: _getpop(kwargs, "weights", None),
+            "std_range": lambda kwargs: _getpop(kwargs, "std_range", None),
             "anisotropy": lambda kwargs: float(_getpop(kwargs, "anisotropy", 1.0)),
             "structure_seed": lambda kwargs: int(_getpop(kwargs, "structure_seed", 0)),
         },

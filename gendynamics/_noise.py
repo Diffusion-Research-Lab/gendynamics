@@ -1,5 +1,6 @@
 """Noise and synthetic-data sampling functions."""
 
+import math
 import numpy as np
 import scipy
 import torch
@@ -188,13 +189,16 @@ def sample_unbalanced_highdim_gaussian_mixture(
     structure_seed: int = 0,
     device: torch.device = "cpu",
     dtype: torch.dtype = torch.float32,
+    weights: torch.Tensor | list[float] | None = None,
+    std_range: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """
     Sample a high-dimensional Gaussian mixture with many imbalanced modes.
 
     The mode centers live in a low-rank latent subspace and are embedded into the
     ambient space. Mixture weights follow a power-law decay to make rare modes easy
-    to collapse under limited model capacity.
+    to collapse under limited model capacity. Explicit weights override that decay;
+    std_range assigns reproducible, log-spaced component noise scales.
     """
     if n_samples <= 0:
         raise ValueError("n_samples must be > 0.")
@@ -222,6 +226,18 @@ def sample_unbalanced_highdim_gaussian_mixture(
         device=device,
         dtype=dtype,
     )
+    if weights is not None:
+        weights = torch.as_tensor(weights, device=device, dtype=dtype)
+        if weights.shape != (n_modes,) or not torch.isfinite(weights).all() or (weights <= 0).any():
+            raise ValueError("weights must contain one finite positive value per mode.")
+        mode_index = torch.multinomial(weights, n_samples, replacement=True)
+    if std_range is not None:
+        low, high = std_range
+        if not 0 < low <= high or not math.isfinite(high):
+            raise ValueError("std_range must contain finite, positive, ordered scales.")
+        generator = torch.Generator(device=device).manual_seed(structure_seed)
+        scales = torch.logspace(math.log10(low), math.log10(high), n_modes, device=device, dtype=dtype)
+        base_std = scales[torch.randperm(n_modes, generator=generator, device=device)][mode_index, None]
 
     noise_iso = torch.randn(n_samples, dim, device=device, dtype=dtype)
     noise_axis = torch.randn(n_samples, 1, device=device, dtype=dtype) * directions[mode_index]
