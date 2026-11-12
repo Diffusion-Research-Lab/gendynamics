@@ -2,9 +2,11 @@
 
 import logging
 import math
+from copy import deepcopy
+import time
 import warnings
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 import torch
 
 
@@ -38,9 +40,28 @@ def train(
     early_stopping_patience: int | None = None,
     early_stopping_min_delta: float = 0.0,
     amp_dtype: str | None = None,
+    validation_fn: Callable[[Any], float | dict[str, float]] | None = None,
+    validation_metric: str = "validation_loss",
+    ema_decay: float | None = None,
+    betas: tuple[float, float] = (0.9, 0.999),
+    update_callback: Callable[[Any, int, int], None] | None = None,
+    callback_every_updates: int = 1,
+    checkpoint_path: str | Path | None = None,
+    log_name: str | None = None,
 ) -> tuple[Any, dict[str, Any]]:
-    """Train a native gendynamics generative model and return diagnostics."""
-    logger = logging.getLogger(__name__)
+    """Train a generative model, optionally selecting EMA weights with validation_fn(model).
+
+    The callback returns a scalar or a mapping containing validation_metric.
+    Without a callback, validation_data is evaluated through the model loss.
+    update_callback(model, completed_updates, total_updates) observes EMA weights
+    at initialization/resumption and fixed update intervals. checkpoint_path saves
+    optimizer, EMA, RNG and optional model training state; existing files resume.
+    log_name optionally labels training messages with the experiment/model name.
+    """
+    logger = logging.getLogger(log_name or __name__)
+    started = time.perf_counter()
+    if callback_every_updates < 1:
+        raise ValueError("callback_every_updates must be positive.")
 
     # Normalize scalar configuration first so errors are raised before setup work.
     batch_size = int(batch_size)
@@ -79,13 +100,15 @@ def train(
         raise TypeError(f"source_data must be a torch.Tensor or None, got {type(source_data)}")
     if validation_data is not None and not isinstance(validation_data, torch.Tensor):
         raise TypeError(f"validation_data must be a torch.Tensor or None, got {type(validation_data)}")
-    if restore_best and validation_data is None:
-        raise ValueError("restore_best requires validation_data.")
+    if restore_best and validation_data is None and validation_fn is None:
+        raise ValueError("restore_best requires validation_data or validation_fn.")
     if early_stopping_patience is not None:
         if early_stopping_patience < 1:
             raise ValueError("early_stopping_patience must be >= 1.")
-        if validation_data is None:
-            raise ValueError("early_stopping_patience requires validation_data.")
+        if validation_data is None and validation_fn is None:
+            raise ValueError("early_stopping_patience requires validation_data or validation_fn.")
+    if ema_decay is not None and not 0 <= ema_decay < 1:
+        raise ValueError("ema_decay must lie in [0, 1).")
     if early_stopping_min_delta < 0.0:
         raise ValueError("early_stopping_min_delta must be non-negative.")
     if not use_adamw and float(weight_decay) != 0.0:
@@ -136,6 +159,7 @@ def train(
     dtype = target.dtype
     net = generative_model._net.to(device=device, dtype=dtype)
     net.train()
+    ema_net = deepcopy(net).requires_grad_(False).eval() if ema_decay is not None else None
 
     # Build tensor batching. Full tensor targets are shuffled once per epoch.
     if pin_memory is None:
@@ -157,7 +181,7 @@ def train(
 
     # Optimizer and learning-rate schedule.
     opt_cls = torch.optim.AdamW if use_adamw else torch.optim.Adam
-    opt = opt_cls(net.parameters(), lr=lr, weight_decay=weight_decay)
+    opt = opt_cls(net.parameters(), lr=lr, weight_decay=weight_decay, betas=betas)
 
     main_steps = max(1, n_epochs * steps_per_epoch - warmup_steps)
     if lr_schedule in (None, "none", "constant"):
@@ -211,10 +235,16 @@ def train(
         "restore_best": restore_best,
         "early_stopping_patience": early_stopping_patience,
         "early_stopping_min_delta": early_stopping_min_delta,
+        "validation_metric": validation_metric,
+        "ema_decay": ema_decay,
+        "betas": betas,
     }
     stats: dict[str, Any] = {"epoch": [], "training_loss": []}
-    if validation is not None:
+    if validation is not None or validation_fn is not None:
         stats["validation_loss"] = []
+    history = []
+    optimization_seconds = validation_seconds = 0.0
+    global_step = 0
     if log_grad_norm:
         stats["grad_norm"] = []
 
@@ -227,13 +257,83 @@ def train(
     last_validation_loss = float("nan")
     best_epoch, best_validation_loss, best_state = 0, float("inf"), None
     epochs_without_improvement = 0
-    for epoch in range(n_epochs):
-        epoch_idx = epoch + 1
-        epoch_loss_sum: torch.Tensor | None = None
-        epoch_loss_count = 0
+    first_epoch, next_start, permutation = 0, 0, None
+    saved_epoch_loss, saved_epoch_count = None, 0
+    checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
+    elapsed_before_resume = 0.0
+    if checkpoint_path is not None and checkpoint_path.exists():
+        state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        if state["train_config"] != train_config or state["n_samples"] != len(target):
+            raise ValueError("Checkpoint training configuration or dataset size differs.")
+        net.load_state_dict(state["model"])
+        opt.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+        if ema_net is not None:
+            ema_net.load_state_dict(state["ema"])
+        if hasattr(generative_model, "load_training_state_dict"):
+            generative_model.load_training_state_dict(state["model_training"])
+        first_epoch, next_start, permutation = state["epoch"], state["next_start"], state["permutation"]
+        saved_epoch_loss, saved_epoch_count = state["epoch_loss"], state["epoch_count"]
+        stats, history, global_step = state["stats"], state["history"], state["update"]
+        best_epoch, best_validation_loss, best_state = state["best"]
+        epochs_without_improvement = state["epochs_without_improvement"]
+        optimization_seconds, validation_seconds = state["timing"]
+        elapsed_before_resume = state["elapsed"]
+        torch.set_rng_state(state["rng"])
+        if device.type == "cuda":
+            torch.cuda.set_rng_state(state["cuda_rng"], device)
+        logger.info("resume | update=%d/%d | checkpoint=%s", global_step, n_epochs * steps_per_epoch, checkpoint_path)
 
-        perm = torch.randperm(len(target), device=target.device)
-        for start in range(0, len(target), batch_size):
+    def save_resume(epoch, start, perm, loss_sum, loss_count):
+        if checkpoint_path is None:
+            return
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        state = {"train_config": train_config, "n_samples": len(target), "model": net.state_dict(),
+                 "optimizer": opt.state_dict(), "scheduler": scheduler.state_dict(),
+                 "ema": None if ema_net is None else ema_net.state_dict(),
+                 "model_training": generative_model.training_state_dict() if hasattr(generative_model, "training_state_dict") else None,
+                 "epoch": epoch, "next_start": start, "permutation": perm,
+                 "epoch_loss": loss_sum, "epoch_count": loss_count, "update": global_step,
+                 "stats": stats, "history": history, "best": (best_epoch, best_validation_loss, best_state),
+                 "epochs_without_improvement": epochs_without_improvement,
+                 "timing": (optimization_seconds, validation_seconds),
+                 "elapsed": elapsed_before_resume + time.perf_counter() - started,
+                 "rng": torch.get_rng_state(), "cuda_rng": torch.cuda.get_rng_state(device) if device.type == "cuda" else None}
+        temporary = checkpoint_path.with_suffix(".part")
+        torch.save(state, temporary)
+        temporary.replace(checkpoint_path)
+
+    def observe():
+        if update_callback is None:
+            return
+        online = generative_model._net
+        generative_model._net = ema_net or net
+        generative_model._net.eval()
+        rng_devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
+        try:
+            with torch.inference_mode(), torch.random.fork_rng(devices=rng_devices):
+                update_callback(generative_model, global_step, n_epochs * steps_per_epoch)
+        finally:
+            generative_model._net = online
+            net.train()
+
+    if hasattr(generative_model, "set_training_progress"):
+        generative_model.set_training_progress(global_step, n_epochs * steps_per_epoch)
+    observation_started = time.perf_counter()
+    observe()
+    if update_callback is not None:
+        validation_seconds += time.perf_counter() - observation_started
+    epoch_idx = first_epoch
+    for epoch in range(first_epoch, n_epochs):
+        epoch_idx = epoch + 1
+        epoch_loss_sum = None if saved_epoch_loss is None else saved_epoch_loss.to(device)
+        epoch_loss_count = saved_epoch_count
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        epoch_started = time.perf_counter()
+
+        perm = torch.randperm(len(target), device=target.device) if permutation is None else permutation.to(target.device)
+        for start in range(next_start, len(target), batch_size):
             x = target[perm[start: start + batch_size]]
             if target_pin:
                 x = x.pin_memory()
@@ -248,24 +348,48 @@ def train(
                 z = z.to(device=device, dtype=dtype, non_blocking=source_pin)
 
             opt.zero_grad(set_to_none=True)
+            if hasattr(generative_model, "set_training_progress"):
+                generative_model.set_training_progress(global_step + 1, n_epochs * steps_per_epoch)
             # BF16 autocast keeps FP32 parameters and AdamW state; its exponent range needs no loss scaler.
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16_amp):
                 loss = generative_model.loss(x, z=z)
             if loss.ndim != 0:
                 raise ValueError(f"generative_model.loss must return a scalar, got shape {tuple(loss.shape)}")
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Non-finite training loss at epoch {epoch_idx}.")
             loss.backward()
             if grad_clip_norm is not None:
                 torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip_norm)
             opt.step()
             scheduler.step()
+            global_step += 1
+            if ema_net is not None:
+                with torch.no_grad():
+                    for average, parameter in zip(ema_net.parameters(), net.parameters(), strict=True):
+                        average.lerp_(parameter, 1 - ema_decay)
+                    for average, buffer in zip(ema_net.buffers(), net.buffers(), strict=True):
+                        average.copy_(buffer)
 
             loss_value = loss.detach()
             epoch_loss_sum = loss_value if epoch_loss_sum is None else epoch_loss_sum + loss_value
             epoch_loss_count += 1
+            if update_callback is not None and (global_step % callback_every_updates == 0 or global_step == n_epochs * steps_per_epoch):
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                optimization_seconds += time.perf_counter() - epoch_started
+                save_resume(epoch, start + len(x), perm, epoch_loss_sum, epoch_loss_count)
+                callback_started = time.perf_counter()
+                observe()
+                callback_seconds = time.perf_counter() - callback_started
+                validation_seconds += callback_seconds
+                epoch_started = time.perf_counter()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        optimization_seconds += time.perf_counter() - epoch_started
 
         # Epoch-end bookkeeping is deliberately light.
         should_record = epoch_idx % stats_freq_epochs == 0 or epoch_idx == n_epochs
-        should_log = freq_logging > 0 and epoch_idx % freq_logging == 0
+        should_log = freq_logging > 0 and (epoch_idx % freq_logging == 0 or epoch_idx == n_epochs)
         should_checkpoint = ckpt_path is not None and epoch_idx % ckpt_freq_epochs == 0
 
         if should_record or should_log or should_checkpoint:
@@ -274,48 +398,66 @@ def train(
             else:
                 last_epoch_loss = float(epoch_loss_sum / epoch_loss_count)
 
-        if validation is not None and (should_record or should_log):
+        metrics = {}
+        if (validation is not None or validation_fn is not None) and (should_record or should_log):
+            validation_started = time.perf_counter()
             validation_loss = 0.0
             net.eval()
+            generative_model._net = ema_net or net
             rng_devices = ([device.index if device.index is not None else torch.cuda.current_device()]
                            if device.type == "cuda" else [])
             # Fixed diffusion noise makes changes in validation loss comparable across epochs.
             with torch.inference_mode(), torch.random.fork_rng(devices=rng_devices):
                 torch.manual_seed(0)
-                for start in range(0, len(validation), batch_size):
-                    x = validation[start: start + batch_size]
-                    if validation_pin:
-                        x = x.pin_memory()
-                    x = x.to(device=device, dtype=dtype, non_blocking=validation_pin)
+                if validation_fn is not None:
+                    metrics = validation_fn(generative_model)
+                    metrics = metrics if isinstance(metrics, dict) else {validation_metric: float(metrics)}
+                else:
+                    for start in range(0, len(validation), batch_size):
+                        x = validation[start: start + batch_size]
+                        if validation_pin:
+                            x = x.pin_memory()
+                        x = x.to(device=device, dtype=dtype, non_blocking=validation_pin)
 
-                    z = None
-                    if source is not None:
-                        idx = torch.randint(0, source.size(0), (x.size(0),), device=source.device)
-                        z = source.index_select(0, idx)
-                        if source_pin:
-                            z = z.pin_memory()
-                        z = z.to(device=device, dtype=dtype, non_blocking=source_pin)
+                        z = None
+                        if source is not None:
+                            idx = torch.randint(0, source.size(0), (x.size(0),), device=source.device)
+                            z = source.index_select(0, idx)
+                            if source_pin:
+                                z = z.pin_memory()
+                            z = z.to(device=device, dtype=dtype, non_blocking=source_pin)
 
-                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16_amp):
-                        loss = generative_model.loss(x, z=z)
-                    if loss.ndim != 0:
-                        raise ValueError(f"generative_model.loss must return a scalar, got shape {tuple(loss.shape)}")
-                    validation_loss += float(loss) * len(x)
-            last_validation_loss = validation_loss / len(validation)
+                        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16_amp):
+                            loss = generative_model.loss(x, z=z)
+                        if loss.ndim != 0:
+                            raise ValueError(f"generative_model.loss must return a scalar, got shape {tuple(loss.shape)}")
+                        validation_loss += float(loss) * len(x)
+            generative_model._net = net
+            last_validation_loss = metrics[validation_metric] if metrics else validation_loss / len(validation)
+            if not math.isfinite(last_validation_loss):
+                raise RuntimeError(f"Non-finite validation score at epoch {epoch_idx}.")
+            metrics = metrics or {"validation_loss": last_validation_loss}
             if last_validation_loss < best_validation_loss - early_stopping_min_delta:
                 best_epoch, best_validation_loss = epoch_idx, last_validation_loss
                 epochs_without_improvement = 0
                 if restore_best:
-                    best_state = {name: value.detach().clone() for name, value in net.state_dict().items()}
+                    best_state = deepcopy((ema_net or net).state_dict())
             else:
                 epochs_without_improvement += 1
             net.train()
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            validation_seconds += time.perf_counter() - validation_started
 
         if should_record:
             stats["epoch"].append(epoch_idx)
             stats["training_loss"].append(last_epoch_loss)
-            if validation is not None:
+            if validation is not None or validation_fn is not None:
                 stats["validation_loss"].append(last_validation_loss)
+            history.append({"epoch": epoch_idx, "updates": global_step, "loss": last_epoch_loss,
+                            "elapsed_seconds": elapsed_before_resume + time.perf_counter() - started,
+                            "optimization_seconds": optimization_seconds, "validation_seconds": validation_seconds,
+                            **({"smoothing_std": generative_model.smoothing_std} if hasattr(generative_model, "smoothing_std") else {}), **metrics})
             if log_grad_norm:
                 grad_sq_sum = 0.0
                 for param in net.parameters():
@@ -326,8 +468,10 @@ def train(
 
         if should_log:
             lr_now = opt.param_groups[0]["lr"]
-            validation_log = f" | validation {last_validation_loss:.6f}" if validation is not None else ""
-            logger.info(f"epoch {epoch_idx:3d}/{n_epochs:3d} | loss {last_epoch_loss:.6f}{validation_log} | lr {lr_now:.3e}")
+            validation_log = f" | {validation_metric}={last_validation_loss:.6g}" if validation is not None or validation_fn is not None else ""
+            smoothing_log = f" | smoothing_std={generative_model.smoothing_std:.4g}" if hasattr(generative_model, "smoothing_std") else ""
+            logger.info("epoch %d/%d | update=%d/%d | loss=%.6f%s | lr=%.3e%s",
+                        epoch_idx, n_epochs, global_step, n_epochs * steps_per_epoch, last_epoch_loss, validation_log, lr_now, smoothing_log)
 
         if early_stopping_patience is not None and epochs_without_improvement >= early_stopping_patience:
             logger.info("train | early stop at epoch %d | best epoch %d | validation %.6f",
@@ -337,18 +481,26 @@ def train(
         if should_checkpoint:
             _save_ckpt(ckpt_path, ckpt_keep_last, epoch_idx, epoch_idx * steps_per_epoch,
                        last_epoch_loss, net, opt, scheduler, train_config)
+        save_resume(epoch + 1, 0, None, None, 0)
+        next_start, permutation, saved_epoch_loss, saved_epoch_count = 0, None, None, 0
 
-    if validation is not None:
+    if validation is not None or validation_fn is not None:
         stats.update({"best_epoch": best_epoch, "best_validation_loss": best_validation_loss})
     if best_state is not None:
         net.load_state_dict(best_state)
         logger.info("train | restored best validation weights from epoch %d", best_epoch)
+    elif ema_net is not None:
+        net.load_state_dict(ema_net.state_dict())
 
     if ckpt_path is not None:
         _save_ckpt(ckpt_path, ckpt_keep_last, epoch_idx, epoch_idx * steps_per_epoch,
                    last_epoch_loss, net, opt, scheduler, train_config)
 
     logger.info("train | done")
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    stats.update({"epochs": epoch_idx, "updates": global_step, "train_seconds": elapsed_before_resume + time.perf_counter() - started,
+                  "optimization_seconds": optimization_seconds, "validation_seconds": validation_seconds, "history": history})
     return generative_model, {"train_config": train_config, "stats": stats}
 
 

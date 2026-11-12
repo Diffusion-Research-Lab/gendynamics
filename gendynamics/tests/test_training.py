@@ -86,6 +86,28 @@ def test_train_can_restore_best_validation_weights():
     assert restored_loss == pytest.approx(diagnostics["stats"]["best_validation_loss"], rel=1e-6)
 
 
+def test_endpoint_validation_selects_best_ema_state():
+    torch.manual_seed(7)
+    model = _DummyGenerativeModel(3)
+    snapshots = []
+    scores = iter((3.0, 1.0, 2.0))
+
+    def validate(fitted):
+        assert not fitted._net.training
+        snapshots.append({key: value.clone() for key, value in fitted._net.state_dict().items()})
+        return {"distance": next(scores)}
+
+    model, diagnostics = train(model, torch.randn(24, 3), n_epochs=3, batch_size=12,
+                               validation_fn=validate, validation_metric="distance", restore_best=True,
+                               ema_decay=0.9, betas=(0.9, 0.95), freq_logging=0)
+    stats = diagnostics["stats"]
+    assert stats["best_epoch"] == 2 and stats["best_validation_loss"] == 1.0
+    assert stats["updates"] == 6 and stats["history"][-1]["distance"] == 2.0
+    assert 0 < stats["optimization_seconds"] + stats["validation_seconds"] <= stats["train_seconds"]
+    for key, value in model._net.state_dict().items():
+        torch.testing.assert_close(value, snapshots[1][key], rtol=0, atol=0)
+
+
 def test_train_can_stop_after_validation_stalls():
     x = torch.randn(96, 3, dtype=torch.float32)
     validation = torch.randn(24, 3, dtype=torch.float32)
